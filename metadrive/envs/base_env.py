@@ -28,6 +28,119 @@ from metadrive.obs.observation_base import DummyObservation
 from metadrive.obs.state_obs import LidarStateObservation
 from metadrive.policy.env_input_policy import EnvInputPolicy
 from metadrive.scenario.utils import convert_recorded_scenario_exported
+# ── Refactoring R2: Chain-of-Responsibility for _post_process_config ──────────
+
+class EnvConfigHandler:
+    """Abstract base class for configuration post-processing handlers."""
+
+    def handle(self, config, env):
+        """Process and return the modified config.
+        
+        :param config: the merged environment config dict
+        :param env: reference to the BaseEnv instance
+        :return: modified config dict
+        """
+        return config
+
+
+class LoggerHandler(EnvConfigHandler):
+    """Handles logger-related configuration: prints env info and controls interface panel."""
+
+    def handle(self, config, env):
+        env.logger.info("Environment: {}".format(env.__class__.__name__))
+        env.logger.info("MetaDrive version: {}".format(VERSION))
+        if not config["show_interface"]:
+            config["interface_panel"] = []
+        return config
+
+
+class TerrainHandler(EnvConfigHandler):
+    """Handles terrain property configuration."""
+
+    def handle(self, config, env):
+        n = config["map_region_size"]
+        assert (n & (n - 1)) == 0 and 512 <= n <= 4096, \
+            "map_region_size should be pow of 2 and < 2048."
+        TerrainProperty.map_region_size = config["map_region_size"]
+        return config
+
+
+class SensorHandler(EnvConfigHandler):
+    """Handles sensor filtering, creation, and interface panel configuration."""
+
+    def handle(self, config, env):
+        # Optimize sensor creation in none-screen mode
+        if not config["use_render"] and not config["image_observation"]:
+            filtered = {}
+            for id, cfg in config["sensors"].items():
+                if len(cfg) > 0 and not issubclass(cfg[0], BaseCamera) and id != "main_camera":
+                    filtered[id] = cfg
+            config["sensors"] = filtered
+            config["interface_panel"] = []
+
+        # Check sensor existence
+        if config["use_render"] or "main_camera" in config["sensors"]:
+            config["sensors"]["main_camera"] = ("MainCamera", *config["window_size"])
+
+        # Merge dashboard config with sensors
+        to_use = []
+        if not config["render_pipeline"] and config["show_interface"] and "main_camera" in config["sensors"]:
+            for panel in config["interface_panel"]:
+                if panel == "dashboard":
+                    config["sensors"]["dashboard"] = (DashBoard,)
+                if panel not in config["sensors"]:
+                    env.logger.warning(
+                        "Fail to add sensor: {} to the interface. "
+                        "Remove it from panel list!".format(panel)
+                    )
+                elif panel == "main_camera":
+                    env.logger.warning("main_camera can not be added to interface_panel, remove")
+                else:
+                    to_use.append(panel)
+        config["interface_panel"] = to_use
+
+        # Merge default sensor to list
+        sensor_cfg = env.default_config()["sensors"].update(config["sensors"])
+        config["sensors"] = sensor_cfg
+
+        # Log sensor list
+        _str = "Sensors: [{}]"
+        sensors_str = ""
+        for _id, cfg in config["sensors"].items():
+            sensors_str += "{}: {}{}, ".format(
+                _id,
+                cfg[0] if isinstance(cfg[0], str) else cfg[0].__name__,
+                cfg[1:]
+            )
+        env.logger.info(_str.format(sensors_str[:-2]))
+        return config
+
+
+class RenderHandler(EnvConfigHandler):
+    """Handles render mode determination and related logging."""
+
+    def handle(self, config, env):
+        if config["use_render"]:
+            assert "main_camera" in config["sensors"]
+            config["_render_mode"] = RENDER_MODE_ONSCREEN
+        else:
+            config["_render_mode"] = RENDER_MODE_NONE
+            for sensor in config["sensors"].values():
+                if sensor[0] == "MainCamera" or (
+                    issubclass(sensor[0], BaseCamera) and sensor[0] != DashBoard
+                ):
+                    config["_render_mode"] = RENDER_MODE_OFFSCREEN
+                    break
+        env.logger.info("Render Mode: {}".format(config["_render_mode"]))
+        env.logger.info("Horizon (Max steps per agent): {}".format(config["horizon"]))
+        if config["truncate_as_terminate"]:
+            env.logger.warning(
+                "When reaching max steps, both 'terminate' and 'truncate' will be True. "
+                "Generally, only the `truncate` should be `True`."
+            )
+        return config
+
+# ── End of R2 handlers ─────────────────────────────────────────────────────────
 from metadrive.utils import Config, merge_dicts, get_np_random, concat_step_infos
 from metadrive.version import VERSION
 
@@ -291,6 +404,7 @@ class BaseEnv(gym.Env):
         self.logger = get_logger()
         set_log_level(config.get("log_level", logging.DEBUG if config.get("debug", False) else logging.INFO))
         merged_config = self.default_config().update(config, False, ["agent_configs", "sensors"])
+        self.handler_flow = []
         global_config = self._post_process_config(merged_config)
 
         self.config = global_config
@@ -322,81 +436,23 @@ class BaseEnv(gym.Env):
         self.start_index = 0
 
     def _post_process_config(self, config):
-        """Add more special process to merged config"""
-        # Cancel interface panel
-        self.logger.info("Environment: {}".format(self.__class__.__name__))
-        self.logger.info("MetaDrive version: {}".format(VERSION))
-        if not config["show_interface"]:
-            config["interface_panel"] = []
-
-        # Adjust terrain
-        n = config["map_region_size"]
-        assert (n & (n - 1)) == 0 and 512 <= n <= 4096, "map_region_size should be pow of 2 and < 2048."
-        TerrainProperty.map_region_size = config["map_region_size"]
-
-        # Multi-Thread
-        # if config["image_on_cuda"]:
-        #     self.logger.info("Turn Off Multi-thread rendering due to image_on_cuda=True")
-        #     config["multi_thread_render"] = False
-
-        # Optimize sensor creation in none-screen mode
-        if not config["use_render"] and not config["image_observation"]:
-            filtered = {}
-            for id, cfg in config["sensors"].items():
-                if len(cfg) > 0 and not issubclass(cfg[0], BaseCamera) and id != "main_camera":
-                    filtered[id] = cfg
-            config["sensors"] = filtered
-            config["interface_panel"] = []
-
-        # Check sensor existence
-        if config["use_render"] or "main_camera" in config["sensors"]:
-            config["sensors"]["main_camera"] = ("MainCamera", *config["window_size"])
-
-        # Merge dashboard config with sensors
-        to_use = []
-        if not config["render_pipeline"] and config["show_interface"] and "main_camera" in config["sensors"]:
-            for panel in config["interface_panel"]:
-                if panel == "dashboard":
-                    config["sensors"]["dashboard"] = (DashBoard, )
-                if panel not in config["sensors"]:
-                    self.logger.warning(
-                        "Fail to add sensor: {} to the interface. Remove it from panel list!".format(panel)
-                    )
-                elif panel == "main_camera":
-                    self.logger.warning("main_camera can not be added to interface_panel, remove")
-                else:
-                    to_use.append(panel)
-        config["interface_panel"] = to_use
-
-        # Merge default sensor to list
-        sensor_cfg = self.default_config()["sensors"].update(config["sensors"])
-        config["sensors"] = sensor_cfg
-
-        # show sensor lists
-        _str = "Sensors: [{}]"
-        sensors_str = ""
-        for _id, cfg in config["sensors"].items():
-            sensors_str += "{}: {}{}, ".format(_id, cfg[0] if isinstance(cfg[0], str) else cfg[0].__name__, cfg[1:])
-        self.logger.info(_str.format(sensors_str[:-2]))
-
-        # determine render mode automatically
-        if config["use_render"]:
-            assert "main_camera" in config["sensors"]
-            config["_render_mode"] = RENDER_MODE_ONSCREEN
-        else:
-            config["_render_mode"] = RENDER_MODE_NONE
-            for sensor in config["sensors"].values():
-                if sensor[0] == "MainCamera" or (issubclass(sensor[0], BaseCamera) and sensor[0] != DashBoard):
-                    config["_render_mode"] = RENDER_MODE_OFFSCREEN
-                    break
-        self.logger.info("Render Mode: {}".format(config["_render_mode"]))
-        self.logger.info("Horizon (Max steps per agent): {}".format(config["horizon"]))
-        if config["truncate_as_terminate"]:
-            self.logger.warning(
-                "When reaching max steps, both 'terminate' and 'truncate will be True."
-                "Generally, only the `truncate` should be `True`."
-            )
+        """
+        Post-process the merged config using a chain of responsibility.
+        Each handler addresses one concern: logging, terrain, sensors, or rendering.
+        New concerns can be added by subclassing EnvConfigHandler and calling
+        self.add_flow_node() here, without modifying existing handler code (OCP).
+        """
+        self.add_flow_node(LoggerHandler())
+        self.add_flow_node(TerrainHandler())
+        self.add_flow_node(SensorHandler())
+        self.add_flow_node(RenderHandler())
+        for handler in self.handler_flow:
+            config = handler.handle(config, self)
         return config
+
+    def add_flow_node(self, handler):
+        """Register a new config handler into the processing chain."""
+        self.handler_flow.append(handler)
 
     def _get_observations(self) -> Dict[str, "BaseObservation"]:
         return {DEFAULT_AGENT: self.get_single_observation()}
