@@ -57,3 +57,4 @@
 # ignore documentation build output
 **/filtered_dataset
 **/semantics.png
+venv/
