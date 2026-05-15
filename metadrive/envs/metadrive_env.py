@@ -13,6 +13,60 @@ from metadrive.envs.base_env import BaseEnv
 from metadrive.manager.traffic_manager import TrafficMode
 from metadrive.utils import clip, Config
 
+# ── Refactoring R3: Strategy pattern for reward computation ───────────────────
+
+class RewardPart:
+    """Abstract base class for individual reward components."""
+
+    def compute(self, env, vehicle, positive_road):
+        """Compute and return (reward_value, info_dict) for this component."""
+        return 0.0, {}
+
+
+class DrivingReward(RewardPart):
+    """Rewards forward progress along the current lane."""
+
+    def compute(self, env, vehicle, positive_road):
+        if vehicle.lane in vehicle.navigation.current_ref_lanes:
+            current_lane = vehicle.lane
+        else:
+            current_lane = vehicle.navigation.current_ref_lanes[0]
+        long_last, _ = current_lane.local_coordinates(vehicle.last_position)
+        long_now, lateral_now = current_lane.local_coordinates(vehicle.position)
+        if env.config["use_lateral_reward"]:
+            lateral_factor = clip(
+                1 - 2 * abs(lateral_now) / vehicle.navigation.get_current_lane_width(), 0.0, 1.0
+            )
+        else:
+            lateral_factor = 1.0
+        r = env.config["driving_reward"] * (long_now - long_last) * lateral_factor * positive_road
+        return r, {"driving_reward": r}
+
+
+class SpeedReward(RewardPart):
+    """Rewards driving at a high speed relative to the vehicle's maximum speed."""
+
+    def compute(self, env, vehicle, positive_road):
+        r = env.config["speed_reward"] * (vehicle.speed_km_h / vehicle.max_speed_km_h) * positive_road
+        return r, {"speed_reward": r}
+
+
+class RewardManager:
+    """Aggregates multiple RewardPart instances into a single step reward."""
+
+    def __init__(self, components):
+        self.components = components
+
+    def compute(self, env, vehicle, positive_road):
+        total = 0.0
+        info = {}
+        for comp in self.components:
+            r, i = comp.compute(env, vehicle, positive_road)
+            total += r
+            info.update(i)
+        return total, info
+
+# ── End of R3 classes ──────────────────────────────────────────────────────────
 METADRIVE_DEFAULT_CONFIG = dict(
     # ===== Generalization =====
     start_seed=0,
@@ -110,6 +164,7 @@ class MetaDriveEnv(BaseEnv):
         # scenario setting
         self.start_seed = self.start_index = self.config["start_seed"]
         self.env_num = self.num_scenarios
+        self.reward_manager = RewardManager([DrivingReward(), SpeedReward()])
 
     def _post_process_config(self, config):
         config = super(MetaDriveEnv, self)._post_process_config(config)
@@ -245,36 +300,27 @@ class MetaDriveEnv(BaseEnv):
 
     def reward_function(self, vehicle_id: str):
         """
-        Override this func to get a new reward function
+        Override this func to get a new reward function.
+        Step rewards are computed by RewardManager; terminal rewards are handled separately.
         :param vehicle_id: id of BaseVehicle
-        :return: reward
+        :return: reward, step_info
         """
         vehicle = self.agents[vehicle_id]
         step_info = dict()
 
-        # Reward for moving forward in current lane
+        # Determine road direction for reward sign
         if vehicle.lane in vehicle.navigation.current_ref_lanes:
-            current_lane = vehicle.lane
             positive_road = 1
         else:
-            current_lane = vehicle.navigation.current_ref_lanes[0]
             current_road = vehicle.navigation.current_road
             positive_road = 1 if not current_road.is_negative_road() else -1
-        long_last, _ = current_lane.local_coordinates(vehicle.last_position)
-        long_now, lateral_now = current_lane.local_coordinates(vehicle.position)
 
-        # reward for lane keeping, without it vehicle can learn to overtake but fail to keep in lane
-        if self.config["use_lateral_reward"]:
-            lateral_factor = clip(1 - 2 * abs(lateral_now) / vehicle.navigation.get_current_lane_width(), 0.0, 1.0)
-        else:
-            lateral_factor = 1.0
-
-        reward = 0.0
-        reward += self.config["driving_reward"] * (long_now - long_last) * lateral_factor * positive_road
-        reward += self.config["speed_reward"] * (vehicle.speed_km_h / vehicle.max_speed_km_h) * positive_road
-
+        # Compute step reward via RewardManager (R3 refactoring)
+        reward, reward_info = self.reward_manager.compute(self, vehicle, positive_road)
+        step_info.update(reward_info)
         step_info["step_reward"] = reward
 
+        # Terminal rewards override step reward
         if self._is_arrive_destination(vehicle):
             reward = +self.config["success_reward"]
         elif self._is_out_of_road(vehicle):
@@ -285,8 +331,8 @@ class MetaDriveEnv(BaseEnv):
             reward = -self.config["crash_object_penalty"]
         elif vehicle.crash_sidewalk:
             reward = -self.config["crash_sidewalk_penalty"]
-        step_info["route_completion"] = vehicle.navigation.route_completion
 
+        step_info["route_completion"] = vehicle.navigation.route_completion
         return reward, step_info
 
     def setup_engine(self):
