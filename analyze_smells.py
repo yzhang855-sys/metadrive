@@ -2,9 +2,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import numpy as np
 
-# ============================================
-# 图1：BaseEnv各方法圈复杂度对比图
-# ============================================
+
 
 methods = [
     '_post_process_config',
@@ -19,7 +17,7 @@ methods = [
 scores = [27, 15, 11, 10, 8, 8, 7, 6]
 grades = ['D', 'C', 'C', 'B', 'B', 'B', 'B', 'B']
 
-# 根据评级设置颜色
+
 colors = []
 for g in grades:
     if g == 'D':
@@ -31,17 +29,18 @@ for g in grades:
 
 fig, ax = plt.subplots(figsize=(10, 5))
 bars = ax.barh(methods, scores, color=colors)
+ax.set_xlim(0, 43)
 ax.set_xlabel('Cyclomatic Complexity Score')
 ax.set_title('BaseEnv Methods: Cyclomatic Complexity', fontsize=13)
 ax.axvline(x=10, color='orange', linestyle='--', alpha=0.7, label='Grade C threshold (10)')
 ax.axvline(x=15, color='red', linestyle='--', alpha=0.7, label='Grade D threshold (15)')
 
-# 在每个bar右侧标注分数和等级
+
 for bar, score, grade in zip(bars, scores, grades):
     ax.text(score + 0.3, bar.get_y() + bar.get_height()/2,
             f'{score} ({grade})', va='center', fontsize=10)
 
-# 图例
+
 red_patch = mpatches.Patch(color='#d32f2f', label='Grade D - High Risk')
 orange_patch = mpatches.Patch(color='#f57c00', label='Grade C - Moderate Risk')
 green_patch = mpatches.Patch(color='#388e3c', label='Grade B - Acceptable')
@@ -51,9 +50,7 @@ plt.tight_layout()
 plt.savefig('/Users/pangjugua/metadrive/cc_baseenv.png', dpi=150)
 print("图1已保存：cc_baseenv.png")
 
-# ============================================
-# 图2：代码构成饼图
-# ============================================
+
 
 fig2, ax2 = plt.subplots(figsize=(7, 7))
 labels = ['Source Code\n(SLOC)', 'Comments', 'Multi-line\nStrings/Docs', 'Blank Lines']
@@ -71,9 +68,7 @@ plt.tight_layout()
 plt.savefig('/Users/pangjugua/metadrive/code_composition.png', dpi=150)
 print("图2已保存：code_composition.png")
 
-# ============================================
-# 图3：已有重构commits时间线
-# ============================================
+
 
 refactor_events = [
     ('2021-03', 'Refactor config system'),
